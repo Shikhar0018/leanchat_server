@@ -191,7 +191,7 @@ def main():
     terms_upload = st.file_uploader("Upload Terms & Conditions (PDF or TXT)", type=["txt", "pdf"], key="terms")
     
     st.write("### Enter your Google Gemini API Key:")
-    api_key_input = st.text_input("API Key", "AIzaSyClwG6Jwz2WmJSjItN-QA_xjuEL-gEjr18", type="password")
+    api_key_input = st.text_input("API Key", "", type="password")
     
     st.write("### Ask a question:")
     user_query = st.text_input("Your Question:", placeholder="Ask about smartphones, privacy, or terms...")
