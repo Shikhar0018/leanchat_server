@@ -1,0 +1,11 @@
+langchain
+langchain_community
+google-generativeai
+flask
+flask-cors
+pandas
+faiss-cpu
+PyPDF2
+huggingface_hub
+sentence_transformers
+streamlit
