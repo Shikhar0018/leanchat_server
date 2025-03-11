@@ -55,15 +55,31 @@ def docs_from_dicts(dict_list: List[dict]) -> List[Document]:
     return docs
 
 def load_csv_file(content: bytes) -> List[Document]:
-    # Use errors="replace" for decoding
-    df = pd.read_csv(io.BytesIO(content))
-    docs = []
-    for _, row in df.iterrows():
-        text = row.to_string()
-        docs.append(Document(page_content=text))
-    return docs
+    try:
+        # Decode bytes to string with proper encoding handling
+        content_str = content.decode('utf-8-sig', errors="replace")
+        
+        # Create pandas DataFrame from string content
+        df = pd.read_csv(io.StringIO(content_str))
+        
+        docs = []
+        for _, row in df.iterrows():
+            # Preserve special characters in text
+            text = row.to_string(index=False)
+            docs.append(Document(page_content=text))
+        return docs
+    
+    except Exception as e:
+        app.logger.error(f"CSV loading error: {str(e)}")
+        return []
 
 def load_text_file(content: bytes, filename: str) -> Document:
+    try:
+        # Try UTF-8-SIG for BOM encoded files
+        text = content.decode('utf-8-sig', errors="replace")
+    except UnicodeDecodeError:
+        text = content.decode('utf-8', errors="replace")
+
     if filename.lower().endswith(".pdf"):
         try:
             from PyPDF2 import PdfReader
@@ -113,13 +129,23 @@ def process_documents():
         docs.append(load_text_file(content, filename))
     
     # Split documents
-    splitter = CharacterTextSplitter(separator="\n", chunk_size=500, chunk_overlap=100)
+    # Modify the text splitter in process_documents()
+    splitter = CharacterTextSplitter(
+    separator="\n",
+    chunk_size=400,  # Reduced for better handling of Arabic script
+    chunk_overlap=50,
+    strip_whitespace=False  # Important for preserving Arabic text formatting
+    )
+
     split_docs = []
     for doc in docs:
         split_docs.extend(splitter.split_text(doc.page_content))
     
     # Create vector store
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings = HuggingFaceEmbeddings(
+        # model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+        )
     session_data['vector_store'] = FAISS.from_documents(
         [Document(page_content=t) for t in split_docs], 
         embeddings
@@ -131,8 +157,10 @@ def process_documents():
 custom_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template=(
-        "You are a consumer chatbot for our smartphone business.\n"
-        "You are free to answer all queries"
+        "You are a multilingual consumer chatbot for our smartphone business. "
+        "You must answer in the same language as the question. "
+        "If the question is in Arabic, respond in Arabic. "
+        "If in English, respond in English.\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n"
         "Answer:"
@@ -280,7 +308,10 @@ def handle_chat():
 
         # Get conversation history and format question
         history = "\n".join(session_data['conversation_history'][-5:])
-        formatted_question = f"Conversation History:\n{history}\n\nNew Question: {data['message']}"
+        formatted_question = (
+        f"Conversation History:\n{history}\n\n"
+        f"New Question (respond in the same language as this question): {data['message']}"
+        )
 
         # Execute the chain
         result = qa_chain({"query": formatted_question})
