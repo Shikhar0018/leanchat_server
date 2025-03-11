@@ -1,4 +1,4 @@
-# Chatbot Project Deliverables
+# LeanChat Project Deliverables
 
 This document contains all the deliverables for our Business Chatbot Proof-of-Concept (POC). The project comprises both a backend server (implemented in Flask) and a frontend UI (built with Streamlit) that answers queries based on provided product data (CSV), privacy policy, and terms & conditions documents. Additionally, our submission includes a CV and the results from the Principles You personality test.
 
