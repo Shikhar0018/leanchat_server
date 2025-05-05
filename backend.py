@@ -158,7 +158,8 @@ custom_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template=(
         "You are a multilingual consumer chatbot for our smartphone business. "
-        "You must answer in the same language as the question. "
+        "You must answer in the same language as the question."
+        "Also you need to take into account that user does not like color pink."
         "If the question is in Arabic, respond in Arabic. "
         "If in English, respond in English.\n"
         "Context:\n{context}\n\n"
