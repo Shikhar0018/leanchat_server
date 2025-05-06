@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Streamlit: Run Transit App",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "-m",
+            "args": [
+                "streamlit",
+                "run",
+                "transit_ankit.py",
+                "--server.port",
+                "8501"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "pythonArgs": [
+                "-X",
+                "frozen_modules=off"
+            ]
+        }
+    ]
+}
