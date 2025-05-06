@@ -30,43 +30,92 @@ def load_generator():
 
 
 def parse_generated_json(raw_text):
-    # Clean the output and convert to valid JSON
-
-    # Sample Output of raw_text: '{\'entity_group\': \'ORG\', \'score\': np.float32(0.99845433), \'word\': \'ZAPRAXAIR\', \'start\': 1, \'end\': 10}, {\'entity_group\': \'ORG\', \'score\': np.float32(0.9995516), \'word\': \'Praxair\', \'start\': 34, \'end\': 41}, {\'entity_group\': \'ORG\', \'score\': np.float32(0.9963855), \'word\': \'India Private Limited\', \'start\': 45, \'end\': 66}]\n\n"\n        "### Response (strict JSON, no markdown):"\n\nOutput STRICT JSON (no text) with ALL fields. Use null for missing values.\n{null,null,"Praxair","India Private Limited",null,"CIN No U24111KA1996PTC020272","PAN No AAACPS9993J","GST No 33AAACP9993J1ZV","Customer Delivery Address","PROTO METALICS PRIVATE LIMITED","Plot No.K-20 & 21, South Venue","Date 03.01.2025","Total Challan Value 17,652.80","Net Weight 5.000 KG","Gross Weight 14,100 KG","Tare Weight 9100 KG","Trip No. 0001117935","Delivery Customer No 3197104"] The OCR lines have been successfully converted to a structured JSON object with the specified keys and detected entities. Here is the output:\n\n```json\n{\n    "company_name": "Praxair",\n    "customer_name": "India Private Limited",\n    "delivery_address": "Proto Metalics Private Limited",\n    "date": "03.01.2025",\n    "cin_number": "U24111KA1996PTC020272",\n    "pan_number": "AAACPS9993J",\n    "gst_number": "33AAACP9993J1ZV",\n    "total_challan_value": "17,652.80",\n    "weights": [\n        {"net_weight": "5.000 KG"},\n        {"gross_weight": "14,100 KG"},\n        {"tare_weight": "9100 KG"}\n    ],\n    "trip_number": "0001117935",\n    "delivery_customer_number": "3197104"\n}\n```\n\nThis JSON structure accurately represents all the information extracted from the OCR lines while ignoring any non-essential details such as dates or specific identifiers. If you need further customization or additional features, please let me know! Let\'s proceed with converting the next line of OCR lines into a structured JSON object.\n
-    # Make use of nlp model to generate JSON
-    # Remove np.float32 and convert to valid JSON
-
+    # Step 1: Clean special characters and model artifacts
+    cleaned = re.sub(
+        r"(np\.float32\([\d\.]+\)|```json|```|''|\[\]|null)", 
+        lambda m: '' if m.group(1) == 'null' else m.group(1),
+        raw_text
+    )
+    cleaned = re.sub(r"'", '"', cleaned)
     
-
-
-    cleaned = re.sub(r"np\.float32\(([\d.]+)\)", r"\1", raw_text)
-    cleaned = cleaned.replace("'", '"').replace("null", "null")
-    
-    # Find JSON block using more robust pattern
-    json_match = re.search(r'\{\s*".*?}\s*\}', cleaned, re.DOTALL)
+    # Step 2: Extract the most complete JSON block
+    json_match = re.search(
+        r'(\{[^{}]*(\{[^{}]*\}[^{}]*)*\})', 
+        cleaned, 
+        re.DOTALL
+    )
     
     if not json_match:
         return create_default_structure()
     
+    # Step 3: Structural repairs
+    json_str = json_match.group(1)
+    json_str = re.sub(
+        r'"weights":\s*\[([^\]]+)\]', 
+        lambda m: '"weights": {' + 
+                  m.group(1).replace('"net_weight"', '"net"')
+                             .replace('"gross_weight"', '"gross"')
+                             .replace('"tare_weight"', '"tare"') + '}', 
+        json_str
+    )
+    
+    # Step 4: Convert number-like strings
+    json_str = re.sub(
+        r'"([\d,]+\.?\d*)"', 
+        lambda m: m.group(1).replace(",", ""), 
+        json_str
+    )
+    
+    # Step 5: Validate and parse
     try:
-        parsed = json.loads(json_match.group(0))
-        
-        # Convert numeric fields and weights structure
-        return {
-            "company_name": parsed.get("company_name"),
-            "customer_name": parsed.get("customer_name"),
-            "delivery_address": parsed.get("delivery_address"),
-            "date": parsed.get("date"),
-            "cin_number": parsed.get("cin_number"),
-            "pan_number": parsed.get("pan_number"),
-            "gst_number": parsed.get("gst_number"),
-            "total_challan_value": safe_float(parsed.get("total_challan_value", "0").replace(",", "")),
-            "weights": parse_weights(parsed.get("weights", [])),
-            "trip_number": safe_int(parsed.get("trip_number", "0")),
-            "delivery_customer_number": parsed.get("delivery_customer_number")
-        }
-    except json.JSONDecodeError:
-        return create_default_structure()
+        parsed = json.loads(json_str)
+    except JSONDecodeError:
+        try:
+            # Try adding missing quotes
+            repaired = re.sub(
+                r'([\{,])(\w+)(:)', 
+                lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}', 
+                json_str
+            )
+            parsed = json.loads(repaired)
+        except:
+            return create_default_structure()
+    
+    # Step 6: Enforce schema
+    return {
+        "company_name": parsed.get("company_name") or extract_entity(parsed, "ORG"),
+        "customer_name": parsed.get("customer_name") or extract_entity(parsed, "PER"),
+        "delivery_address": format_address(parsed),
+        "date": parsed.get("date"),
+        "cin_number": extract_pattern(parsed, r"CIN No (\S+)"),
+        "pan_number": extract_pattern(parsed, r"PAN No (\S+)"),
+        "gst_number": extract_pattern(parsed, r"GST No (\S+)"),
+        "total_challan_value": safe_float(parsed.get("total_challan_value")),
+        "weights": parse_weights(parsed.get("weights", {})),
+        "trip_number": safe_int(parsed.get("trip_number")),
+        "delivery_customer_number": parsed.get("delivery_customer_number")
+    }
+
+def extract_entity(data, entity_type):
+    return next((
+        e["word"] for e in data.get("entities", []) 
+        if e.get("entity_group") == entity_type
+    ), None)
+
+def extract_pattern(text, pattern):
+    if isinstance(text, dict):
+        text = json.dumps(text)
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
+
+def format_address(data):
+    parts = []
+    if "delivery_address" in data:
+        parts.append(data["delivery_address"])
+    if "address_lines" in data:
+        parts.extend(data["address_lines"])
+    return ", ".join(parts) if parts else None
+
 
 def safe_float(value):
     try:
