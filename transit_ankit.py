@@ -1,251 +1,161 @@
 import streamlit as st
-from transformers import pipeline
-import json
-import re
-from json import JSONDecodeError
-import numpy as np
+import pdfplumber                                              # PDF parsing :contentReference[oaicite:5]{index=5}
+from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification, AutoModelForCausalLM, AutoProcessor, AutoModelForDocumentQuestionAnswering
+import json, re, numpy as np
+from PIL import Image                                          # For page images
 
+# ── Configuration ───────────────────────────────────────────────────────────────
+NER_MODEL_NAME      = "dslim/distilbert-NER"                    # ~261 MB, F1≈0.92 on CoNLL‑2003 :contentReference[oaicite:6]{index=6}
+PDF_QA_MODEL        = "microsoft/layoutlmv3-base"               # LayoutLMv3 for Doc‑QA :contentReference[oaicite:7]{index=7}
+GEN_MODEL           = "Qwen/Qwen1.5-0.5B-Chat"                   # No SentencePiece, CPU‑runnable :contentReference[oaicite:8]{index=8}
 
-# Configuration
-NER_MODEL_NAME = "Davlan/distilbert-base-multilingual-cased-ner-hrl"
-GENERATION_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"  # Updated to better model
+# ── PDF → text+words+boxes+image ─────────────────────────────────────────────────
+def extract_pages(uploaded_file):
+    """Return list of dicts: {text, words, boxes, image} for each page."""
+    pages = []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            # 1) raw text (layout‑aware) :contentReference[oaicite:9]{index=9}
+            txt = page.extract_text(layout=True)
+            # 2) word‑level OCR boxes :contentReference[oaicite:10]{index=10}
+            wdicts = page.extract_words()
+            words = [w["text"] for w in wdicts]
+            boxes = [[w["x0"], w["top"], w["x1"], w["bottom"]] for w in wdicts]
+            # 3) render page as PIL image :contentReference[oaicite:11]{index=11}
+            pil_img = page.to_image(resolution=300).original
+            pages.append({"text": txt, "words": words, "boxes": boxes, "image": pil_img})
+    return pages
 
-def process_entities(text):
-    ner_pipeline = pipeline(
-        "ner",
-        model=NER_MODEL_NAME,
-        aggregation_strategy="simple"
-    )
-    return ner_pipeline(text)
-
-# Load generation pipeline once
+# ── Load pipelines once ──────────────────────────────────────────────────────────
 @st.cache_resource
-def load_generator():
+def load_ner():
+    tok = AutoTokenizer.from_pretrained(NER_MODEL_NAME)
+    mdl = AutoModelForTokenClassification.from_pretrained(NER_MODEL_NAME)
+    return pipeline("ner", model=mdl, tokenizer=tok, aggregation_strategy="simple", device=-1)
+
+@st.cache_resource
+def load_pdf_qa():
+    # 1. Build processor (image_processor + tokenizer)
+    processor = AutoProcessor.from_pretrained(PDF_QA_MODEL, apply_ocr=True)
+    # 2. Load the extractive QA model
+    model = AutoModelForDocumentQuestionAnswering.from_pretrained(PDF_QA_MODEL)
+    # 3. Create the pipeline with both tokenizer & feature_extractor
     return pipeline(
-        "text-generation",
-        model=GENERATION_MODEL,
-        device="mps",
-        max_new_tokens=512  # Increased token limit
+        "document-question-answering",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.image_processor,
+        device=-1
     )
 
+@st.cache_resource
+def load_gen():
+    tok = AutoTokenizer.from_pretrained(GEN_MODEL, trust_remote_code=True)
+    mdl = AutoModelForCausalLM.from_pretrained(GEN_MODEL, trust_remote_code=True)
+    return pipeline("text-generation", model=mdl, tokenizer=tok, device=-1, max_new_tokens=256)
 
-def parse_generated_json(raw_text):
-    # Step 1: Clean special characters and model artifacts
-    cleaned = re.sub(
-        r"(np\.float32\([\d\.]+\)|```json|```|''|\[\]|null)", 
-        lambda m: '' if m.group(1) == 'null' else m.group(1),
-        raw_text
-    )
-    cleaned = re.sub(r"'", '"', cleaned)
-    
-    # Step 2: Extract the most complete JSON block
-    json_match = re.search(
-        r'(\{[^{}]*(\{[^{}]*\}[^{}]*)*\})', 
-        cleaned, 
-        re.DOTALL
-    )
-    
-    if not json_match:
-        return create_default_structure()
-    
-    # Step 3: Structural repairs
-    json_str = json_match.group(1)
-    json_str = re.sub(
-        r'"weights":\s*\[([^\]]+)\]', 
-        lambda m: '"weights": {' + 
-                  m.group(1).replace('"net_weight"', '"net"')
-                             .replace('"gross_weight"', '"gross"')
-                             .replace('"tare_weight"', '"tare"') + '}', 
-        json_str
-    )
-    
-    # Step 4: Convert number-like strings
-    json_str = re.sub(
-        r'"([\d,]+\.?\d*)"', 
-        lambda m: m.group(1).replace(",", ""), 
-        json_str
-    )
-    
-    # Step 5: Validate and parse
-    try:
-        parsed = json.loads(json_str)
-    except JSONDecodeError:
-        try:
-            # Try adding missing quotes
-            repaired = re.sub(
-                r'([\{,])(\w+)(:)', 
-                lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}', 
-                json_str
-            )
-            parsed = json.loads(repaired)
-        except:
-            return create_default_structure()
-    
-    # Step 6: Enforce schema
+# ── JSON parsing helpers ─────────────────────────────────────────────────────────
+def safe_float(v):
+    try: return float(str(v).replace(",", "").split()[0])
+    except: return 0.0
+
+def safe_int(v):
+    try: return int("".join(filter(str.isdigit, str(v))))
+    except: return 0
+
+def create_default():
     return {
-        "company_name": parsed.get("company_name") or extract_entity(parsed, "ORG"),
-        "customer_name": parsed.get("customer_name") or extract_entity(parsed, "PER"),
-        "delivery_address": format_address(parsed),
-        "date": parsed.get("date"),
-        "cin_number": extract_pattern(parsed, r"CIN No (\S+)"),
-        "pan_number": extract_pattern(parsed, r"PAN No (\S+)"),
-        "gst_number": extract_pattern(parsed, r"GST No (\S+)"),
-        "total_challan_value": safe_float(parsed.get("total_challan_value")),
-        "weights": parse_weights(parsed.get("weights", {})),
-        "trip_number": safe_int(parsed.get("trip_number")),
-        "delivery_customer_number": parsed.get("delivery_customer_number")
+      "company_name":None,"customer_name":None,"delivery_address":None,
+      "date":None,"cin_number":None,"pan_number":None,"gst_number":None,
+      "total_challan_value":0.0,"weights":{"net":0.0,"gross":0.0,"tare":0.0},
+      "trip_number":0,"delivery_customer_number":None
     }
 
-def extract_entity(data, entity_type):
-    return next((
-        e["word"] for e in data.get("entities", []) 
-        if e.get("entity_group") == entity_type
-    ), None)
+# ── Top‑level parsing of PDF via Doc‑QA ──────────────────────────────────────────
+def process_pdf(pages):
+    """
+    Ask key questions of the first page image.
+    The pipeline will:
+      1) run OCR on the image,
+      2) tokenize words + boxes,
+      3) forward pixel_values + bbox + input_ids into the model.
+    """
+    qa = load_pdf_qa()
+    img = pages[0]["image"]   # a PIL.Image from pdfplumber
 
-def extract_pattern(text, pattern):
-    if isinstance(text, dict):
-        text = json.dumps(text)
-    match = re.search(pattern, text)
-    return match.group(1) if match else None
+    out = {}
+    questions = {
+        "company_name":        "What is the company name?",
+        "total_challan_value": "What is the total challan value?",
+        "weights":             "What are the net, gross, and tare weights?",
+        "gst_number":          "What is the GST number?",
+        "trip_number":         "What is the trip number?"
+    }
 
-def format_address(data):
-    parts = []
-    if "delivery_address" in data:
-        parts.append(data["delivery_address"])
-    if "address_lines" in data:
-        parts.extend(data["address_lines"])
-    return ", ".join(parts) if parts else None
+    for key, ques in questions.items():
+        # ← correct kwarg name is `image=`
+        answers = qa(image=img, question=ques)
+        out[key] = answers[0]["answer"] if answers else None
 
-
-def safe_float(value):
-    try:
-        return float(str(value).replace(",", "").split()[0])
-    except:
-        return 0.0
-
-def safe_int(value):
-    try:
-        return int(''.join(filter(str.isdigit, str(value))))
-    except:
-        return 0
-
-def parse_weights(weights):
-    if isinstance(weights, list):
-        return {
-            "net": safe_float(weights[0].get("net_weight") if weights else 0),
-            "gross": safe_float(weights[1].get("gross_weight") if len(weights) > 1 else 0),
-            "tare": safe_float(weights[2].get("tare_weight") if len(weights) > 2 else 0)
+    # post‑process weights into sub‑fields
+    if out.get("weights"):
+        nums = re.findall(r"[\d,.]+", out["weights"])
+        out["weights"] = {
+            "net":   float(nums[0].replace(",", "")) if len(nums)>0 else 0.0,
+            "gross": float(nums[1].replace(",", "")) if len(nums)>1 else 0.0,
+            "tare":  float(nums[2].replace(",", "")) if len(nums)>2 else 0.0,
         }
-    return {
-        "net": safe_float(weights.get("net", 0)),
-        "gross": safe_float(weights.get("gross", 0)),
-        "tare": safe_float(weights.get("tare", 0))
-    }
 
-def create_default_structure():
-    return {
-        "company_name": None,
-        "customer_name": None,
-        "delivery_address": None,
-        "date": None,
-        "cin_number": None,
-        "pan_number": None,
-        "gst_number": None,
-        "total_challan_value": 0.0,
-        "weights": {"net": 0.0, "gross": 0.0, "tare": 0.0},
-        "trip_number": 0,
-        "delivery_customer_number": None
-    }
+    return out
 
-def extract_complete_json(text):
-    """Improved JSON extraction with validation"""
-    try:
-        # Find first complete JSON object
-        matches = re.findall(r'\{[^{}]*\}', text)
-        if matches:
-            return json.loads(matches[0])
-        return None
-    except JSONDecodeError:
-        return None
 
-def generate_structured_data_locally(ocr_lines, entities):
-    # Improved prompt structure
-    prompt = f""" "### Instruction:\n"
-        "Convert these OCR lines into a structured JSON object with keys:\n"
-        "company_name, customer_name, delivery_address, date, cin_number, pan_number, "
-        "gst_number, total_challan_value, weights (net, gross, tare), trip_number, delivery_customer_number.\n\n"
-        f"OCR lines: {ocr_lines}\n"
-        f"Detected entities: {entities}\n\n"
-        "### Response (strict JSON, no markdown):"
-
-Output STRICT JSON (no text) with ALL fields. Use null for missing values.
-{{"""
-    
-    generator = load_generator()
-    output = generator(
-        prompt,
-        do_sample=False,
-        num_return_sequences=1,
-        eos_token_id=generator.tokenizer.eos_token_id,
-        pad_token_id=generator.tokenizer.eos_token_id,
-        # return_full_text=False  # Prevent prompt repetition
+# ── Fallback: NER + LLM → JSON ───────────────────────────────────────────────────
+def fallback_json(ocr_lines, entities):
+    gen = load_gen()
+    prompt = (
+      "### Instruction:\n"
+      "Convert these OCR lines + entities into STRICT JSON with keys:\n"
+      "company_name, customer_name, delivery_address, date, cin_number, pan_number,\n"
+      "gst_number, total_challan_value, weights (net, gross, tare), trip_number,\n"
+      "delivery_customer_number.\n\n"
+      f"OCR lines: {ocr_lines}\nEntities: {entities}\n\n"
+      "### Response (strict JSON, no markdown):"
     )
-    
-    # Extract and validate JSON
-    raw_json = "{" + output[0]["generated_text"].split("{", 1)[-1]
-    # parsed = extract_complete_json(raw_json)
-    parsed = parse_generated_json(raw_json)
-    
-    # Ensure required fields exist
-    # required_fields = {
-    #     "company_name": None,
-    #     "customer_name": None,
-    #     "delivery_address": None,
-    #     "date": None,
-    #     "cin_number": None,
-    #     "pan_number": None,
-    #     "gst_number": None,
-    #     "total_challan_value": None,
-    #     "weights": {
-    #         "net": None,
-    #         "gross": None,
-    #         "tare": None
-    #     },
-    #     "trip_number": None,
-    #     "delivery_customer_number": None
-    # }
-    
-    # if parsed:
-    #     for key in required_fields:
-    #         if key in parsed:
-    #             required_fields[key] = parsed[key]
-    #     return required_fields
-    return parsed
+    txt = gen(prompt, do_sample=False)[0]["generated_text"]
+    m = re.search(r"\{.*\}", txt, re.DOTALL)
+    if not m:
+        return create_default()
+    try:
+        obj = json.loads(m.group(0))
+        return obj
+    except:
+        return create_default()
 
+# ── Streamlit UI ────────────────────────────────────────────────────────────────
 def main():
-    st.title("OCR Data Structuring")
-    
-    ocr_input = st.text_area("Paste OCR lines (one per line)", height=200)
-    
-    if ocr_input:
-        ocr_lines = [line.strip() for line in ocr_input.split('\n') if line.strip()]
-        full_text = " ".join(ocr_lines)
-        
-        with st.spinner("Analyzing content..."):
-            entities = process_entities(full_text)
-        
-        st.subheader("Detected Entities")
-        st.write(entities)
-        
-        if st.button("Generate Structured Data"):
-            with st.spinner("Generating JSON structure..."):
-                try:
-                    result = generate_structured_data_locally(ocr_lines, entities)
-                    st.subheader("Structured Output")
-                    st.json(result)
-                    
-                except Exception as e:
-                    st.error(f"Error generating JSON: {str(e)}")
+    st.title("PDF → Structured JSON (Offline)")
+    upload = st.file_uploader("Upload PDF", type="pdf")
+    if not upload:
+        st.info("Please upload a PDF document.")
+        return
+
+    # 1) extract pages
+    with st.spinner("Extracting PDF pages…"):
+        pages = extract_pages(upload)
+
+    # 2) try document‑QA
+    with st.spinner("Running Document QA…"):
+        qa_res = process_pdf(pages)
+
+    # If any key is missing, fall back on NER+LLM
+    if any(qa_res[k] in (None, "") for k in qa_res):
+        ocr_txt = [p["text"] for p in pages]
+        full = " ".join(ocr_txt)
+        ents = load_ner()(full)
+        qa_res = fallback_json(ocr_txt, ents)
+
+    st.subheader("Structured Output")
+    st.json(qa_res)
 
 if __name__ == "__main__":
     main()

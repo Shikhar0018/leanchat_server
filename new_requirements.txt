@@ -1,4 +1,8 @@
 streamlit
 transformers                 # Hugging Face pipelines :contentReference[oaicite:2]{index=2}
 torch                        # runtime for transformer models
+pdfplumber 
+torchvision
+pytesseract 
+pdf2image
 # Davlan/distilbert-base-multilingual-cased-ner-hrl  # your NER model
