@@ -29,118 +29,130 @@ def load_generator():
     )
 
 
+
 def parse_generated_json(raw_text):
-    # Step 1: Clean special characters and model artifacts
+    # Clean the raw text
     cleaned = re.sub(
-        r"(np\.float32\([\d\.]+\)|```json|```|''|\[\]|null)", 
-        lambda m: '' if m.group(1) == 'null' else m.group(1),
+        r"(np\.float32\([\d\.]+\)|```json|```|''|\[\]|null|\\n)",
+        lambda m: '',
         raw_text
     )
     cleaned = re.sub(r"'", '"', cleaned)
     
-    # Step 2: Extract the most complete JSON block
-    json_match = re.search(
-        r'(\{[^{}]*(\{[^{}]*\}[^{}]*)*\})', 
-        cleaned, 
-        re.DOTALL
-    )
+    # Advanced JSON extraction with nested pattern matching
+    return cleaned
+    json_str = None
+    deepest_level = 0
+    for match in re.finditer(r'(\{([^{}]*|(?R))*\})', cleaned, re.DOTALL):
+        candidate = match.group(0)
+        brace_diff = candidate.count('{') - candidate.count('}')
+        if brace_diff == 0 and candidate.count('{') > deepest_level:
+            json_str = candidate
+            deepest_level = candidate.count('{')
     
-    if not json_match:
+    if not json_str:
         return create_default_structure()
     
-    # Step 3: Structural repairs
-    json_str = json_match.group(1)
+    # JSON repair operations
+    json_str = (
+        json_str
+        .replace('", "', '", "')  # Fix missing commas
+        .replace(':"', ': "')      # Add space after colons
+        .replace(',"', ', "')      # Add space after commas
+        .replace('"{', '{')        # Remove quoted braces
+        .replace('}"', '}')
+    )
+    
+    # Convert weight array to proper object
     json_str = re.sub(
-        r'"weights":\s*\[([^\]]+)\]', 
-        lambda m: '"weights": {' + 
-                  m.group(1).replace('"net_weight"', '"net"')
-                             .replace('"gross_weight"', '"gross"')
-                             .replace('"tare_weight"', '"tare"') + '}', 
+        r'"weights":\s*\[([^\]]+)\]',
+        lambda m: f'"weights": {{{m.group(1).replace("_weight", "")}}}',
         json_str
     )
     
-    # Step 4: Convert number-like strings
-    json_str = re.sub(
-        r'"([\d,]+\.?\d*)"', 
-        lambda m: m.group(1).replace(",", ""), 
-        json_str
-    )
-    
-    # Step 5: Validate and parse
     try:
         parsed = json.loads(json_str)
     except JSONDecodeError:
+        # Try to repair malformed JSON
         try:
-            # Try adding missing quotes
-            repaired = re.sub(
-                r'([\{,])(\w+)(:)', 
-                lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}', 
+            parsed = json.loads(re.sub(
+                r'("[\w_]+")\s*:',
+                lambda m: f'{m.group(1)}:',
                 json_str
-            )
-            parsed = json.loads(repaired)
+            ))
         except:
             return create_default_structure()
     
-    # Step 6: Enforce schema
+    # Field normalization
     return {
-        "company_name": parsed.get("company_name") or extract_entity(parsed, "ORG"),
-        "customer_name": parsed.get("customer_name") or extract_entity(parsed, "PER"),
+        "company_name": (
+            parsed.get("company_name") 
+            or extract_value(parsed, ["ORG", "Praxair"])
+        ),
+        "customer_name": extract_value(parsed, ["customer_name", "ZAPRAXAIR"]),
         "delivery_address": format_address(parsed),
-        "date": parsed.get("date"),
-        "cin_number": extract_pattern(parsed, r"CIN No (\S+)"),
-        "pan_number": extract_pattern(parsed, r"PAN No (\S+)"),
-        "gst_number": extract_pattern(parsed, r"GST No (\S+)"),
-        "total_challan_value": safe_float(parsed.get("total_challan_value")),
-        "weights": parse_weights(parsed.get("weights", {})),
+        "date": parse_date(parsed.get("date")),
+        "cin_number": extract_pattern(json_str, r"CIN No (\S+)"),
+        "pan_number": extract_pattern(json_str, r"PAN No (\S+)"),
+        "gst_number": extract_pattern(json_str, r"GST No (\S+)"),
+        "total_challan_value": convert_currency(
+            parsed.get("total_challan_value")
+        ),
+        "weights": {
+            "net": convert_weight(parsed.get("weights", {}).get("net")),
+            "gross": convert_weight(parsed.get("weights", {}).get("gross")),
+            "tare": convert_weight(parsed.get("weights", {}).get("tare"))
+        },
         "trip_number": safe_int(parsed.get("trip_number")),
         "delivery_customer_number": parsed.get("delivery_customer_number")
     }
 
-def extract_entity(data, entity_type):
-    return next((
-        e["word"] for e in data.get("entities", []) 
-        if e.get("entity_group") == entity_type
-    ), None)
+# Helper functions
+def extract_value(data, keys):
+    for key in keys:
+        if isinstance(data, dict) and data.get(key):
+            return data[key]
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get(key):
+                    return item[key]
+    return None
 
-def extract_pattern(text, pattern):
-    if isinstance(text, dict):
-        text = json.dumps(text)
-    match = re.search(pattern, text)
+def extract_pattern(text, regex):
+    match = re.search(regex, text)
     return match.group(1) if match else None
 
 def format_address(data):
+    address_keys = ["delivery_address", "address", "location"]
     parts = []
-    if "delivery_address" in data:
-        parts.append(data["delivery_address"])
-    if "address_lines" in data:
-        parts.extend(data["address_lines"])
+    for key in address_keys:
+        if data.get(key):
+            parts.append(str(data[key]))
     return ", ".join(parts) if parts else None
 
-
-def safe_float(value):
+def convert_currency(value):
     try:
-        return float(str(value).replace(",", "").split()[0])
+        return float(str(value).replace(",", "").replace("₹", "").strip())
     except:
         return 0.0
+
+def convert_weight(value):
+    try:
+        return float(str(value).split()[0].replace(",", ""))
+    except:
+        return 0.0
+
+def parse_date(date_str):
+    try:
+        return re.sub(r"(\d{2})\.(\d{2})\.(\d{4})", r"\3-\2-\1", str(date_str))
+    except:
+        return None
 
 def safe_int(value):
     try:
         return int(''.join(filter(str.isdigit, str(value))))
     except:
         return 0
-
-def parse_weights(weights):
-    if isinstance(weights, list):
-        return {
-            "net": safe_float(weights[0].get("net_weight") if weights else 0),
-            "gross": safe_float(weights[1].get("gross_weight") if len(weights) > 1 else 0),
-            "tare": safe_float(weights[2].get("tare_weight") if len(weights) > 2 else 0)
-        }
-    return {
-        "net": safe_float(weights.get("net", 0)),
-        "gross": safe_float(weights.get("gross", 0)),
-        "tare": safe_float(weights.get("tare", 0))
-    }
 
 def create_default_structure():
     return {
@@ -242,7 +254,9 @@ def main():
                 try:
                     result = generate_structured_data_locally(ocr_lines, entities)
                     st.subheader("Structured Output")
-                    st.json(result)
+                    # st.json(result)
+                    st.write(result)
+
                     
                 except Exception as e:
                     st.error(f"Error generating JSON: {str(e)}")
