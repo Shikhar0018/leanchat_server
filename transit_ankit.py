@@ -6,7 +6,7 @@ from PIL import Image                                          # For page images
 
 # ── Configuration ───────────────────────────────────────────────────────────────
 NER_MODEL_NAME      = "dslim/distilbert-NER"                    # ~261 MB, F1≈0.92 on CoNLL‑2003 :contentReference[oaicite:6]{index=6}
-PDF_QA_MODEL        = "microsoft/layoutlmv3-base"               # LayoutLMv3 for Doc‑QA :contentReference[oaicite:7]{index=7}
+PDF_QA_MODEL = "impira/layoutlm-document-qa"  # Verified working model
 GEN_MODEL           = "Qwen/Qwen1.5-0.5B-Chat"                   # No SentencePiece, CPU‑runnable :contentReference[oaicite:8]{index=8}
 
 # ── PDF → text+words+boxes+image ─────────────────────────────────────────────────
@@ -33,20 +33,6 @@ def load_ner():
     mdl = AutoModelForTokenClassification.from_pretrained(NER_MODEL_NAME)
     return pipeline("ner", model=mdl, tokenizer=tok, aggregation_strategy="simple", device=-1)
 
-@st.cache_resource
-def load_pdf_qa():
-    # 1. Build processor (image_processor + tokenizer)
-    processor = AutoProcessor.from_pretrained(PDF_QA_MODEL, apply_ocr=True)
-    # 2. Load the extractive QA model
-    model = AutoModelForDocumentQuestionAnswering.from_pretrained(PDF_QA_MODEL)
-    # 3. Create the pipeline with both tokenizer & feature_extractor
-    return pipeline(
-        "document-question-answering",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.image_processor,
-        device=-1
-    )
 
 @st.cache_resource
 def load_gen():
@@ -71,43 +57,47 @@ def create_default():
       "trip_number":0,"delivery_customer_number":None
     }
 
-# ── Top‑level parsing of PDF via Doc‑QA ──────────────────────────────────────────
+# Modified document QA setup
+@st.cache_resource
+def load_pdf_qa():
+    from transformers import pipeline
+    return pipeline(
+        "document-question-answering",
+        model=PDF_QA_MODEL,
+        device=-1
+    )
+
+# Revised processing function
 def process_pdf(pages):
-    """
-    Ask key questions of the first page image.
-    The pipeline will:
-      1) run OCR on the image,
-      2) tokenize words + boxes,
-      3) forward pixel_values + bbox + input_ids into the model.
-    """
     qa = load_pdf_qa()
-    img = pages[0]["image"]   # a PIL.Image from pdfplumber
+    img = pages[0]["image"]
+    
+    # Convert image to RGB and ensure proper format
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    
+    # Create question-answer pairs
+    queries = [
+        ("company_name", "What is the company name shown?"),
+        ("total_value", "What is the total challan value?"),
+        ("gst_number", "What is the GSTIN number?"),
+        ("trip_number", "What is the trip number?")
+    ]
+    
+    results = {}
+    for key, question in queries:
+        try:
+            answer = qa(image=img, question=question, top_k=1)[0]["answer"]
+            results[key] = answer if answer != "unknown" else None
+        except Exception as e:
+            st.warning(f"Failed to get {key}: {str(e)}")
+            results[key] = None
 
-    out = {}
-    questions = {
-        "company_name":        "What is the company name?",
-        "total_challan_value": "What is the total challan value?",
-        "weights":             "What are the net, gross, and tare weights?",
-        "gst_number":          "What is the GST number?",
-        "trip_number":         "What is the trip number?"
-    }
-
-    for key, ques in questions.items():
-        # ← correct kwarg name is `image=`
-        answers = qa(image=img, question=ques)
-        out[key] = answers[0]["answer"] if answers else None
-
-    # post‑process weights into sub‑fields
-    if out.get("weights"):
-        nums = re.findall(r"[\d,.]+", out["weights"])
-        out["weights"] = {
-            "net":   float(nums[0].replace(",", "")) if len(nums)>0 else 0.0,
-            "gross": float(nums[1].replace(",", "")) if len(nums)>1 else 0.0,
-            "tare":  float(nums[2].replace(",", "")) if len(nums)>2 else 0.0,
-        }
-
-    return out
-
+    # Numeric value extraction
+    if results.get("total_value"):
+        results["total_challan_value"] = safe_float(results["total_value"])
+    
+    return results
 
 # ── Fallback: NER + LLM → JSON ───────────────────────────────────────────────────
 def fallback_json(ocr_lines, entities):
