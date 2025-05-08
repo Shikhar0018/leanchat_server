@@ -1,91 +1,59 @@
 import streamlit as st
-import pdfplumber
-import pytesseract
-from transformers import (
-    pipeline, AutoTokenizer, AutoModelForTokenClassification,
-    AutoModelForCausalLM, AutoProcessor
-)
-import json
-import re
-from datetime import datetime
+from pdf2image import convert_from_bytes
+from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+import torch
 
-# ── Configuration ──────────────────────────────────────────────────
-PDF_QA_MODEL = "impira/layoutlm-document-qa"
-NER_MODEL = "Babelscape/wikineural-multilingual-ner"
-GEN_MODEL = "Qwen/Qwen1.5-0.5B-Chat"
-
-# ── Cached Resources ───────────────────────────────────────────────
 @st.cache_resource
-def load_models():
-    return {
-        "qa": pipeline("document-question-answering", model=PDF_QA_MODEL, device=-1),
-        "ner": pipeline("ner", model=NER_MODEL, aggregation_strategy="best", device=-1),
-        "gen": pipeline("text-generation", model=GEN_MODEL, device=-1, max_new_tokens=512)
-    }
+def load_ocr_components():
+    # Load components separately with explicit settings
+    feature_extractor = ViTImageProcessor.from_pretrained("microsoft/trocr-small-printed")
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/trocr-small-printed", use_fast=True)
+    model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    return feature_extractor, tokenizer, model, device
 
-# ── PDF Processing ────────────────────────────────────────────────
-def extract_pdf_data(uploaded_file):
+def perform_ocr(pdf_bytes, dpi=200):
+    """Perform OCR using VisionEncoderDecoder with GPT2 tokenizer"""
+    feature_extractor, tokenizer, model, device = load_ocr_components()
+    
+    images = convert_from_bytes(pdf_bytes, dpi=dpi)
     full_text = []
-    raw_ocr_pages = []
     
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # Extract text with layout preservation
-            text = page.extract_text(layout=True) or ""
-            if not text.strip():
-                # Fallback to OCR for scanned pages
-                img = page.to_image(resolution=300).original
-                text = pytesseract.image_to_string(img, lang="eng")
-            
-            full_text.append(text)
-            raw_ocr_pages.append({
-                "page": page_num + 1,
-                "text": text,
-                "dimensions": (page.width, page.height)
-            })
-    
-    return " ".join(full_text), raw_ocr_pages
-
-# ── Streamlit UI ──────────────────────────────────────────────────
-def main():
-    st.title("📄 Industrial Document Processor")
-    uploaded_file = st.file_uploader("Upload PDF Document", type=["pdf"])
-    
-    if uploaded_file:
-        # Extract text and show raw OCR
-        with st.spinner("Extracting document content..."):
-            processed_text, raw_ocr = extract_pdf_data(uploaded_file)
-            
-            st.subheader("Raw OCR Preview")
-            with st.expander("View Raw Extracted Text", expanded=False):
-                for page in raw_ocr:
-                    st.markdown(f"**Page {page['page']}** ({page['dimensions'][0]}x{page['dimensions'][1]}px)")
-                    st.code(page['text'], language="text")
-                    st.divider()
-
-        # Process document
-        with st.spinner("Analyzing document structure..."):
-            models = load_models()
-            entities = models["ner"](processed_text)
-            qa_results = answer_questions(uploaded_file, models["qa"])
-            structured_data = validate_structure({
-                **parse_entities(entities),
-                **qa_results
-            })
+    for idx, image in enumerate(images):
+        st.progress((idx + 1) / len(images))
         
-        # Show results
-        st.subheader("Structured Output")
-        st.json(structured_data)
+        # Process image through feature extractor
+        pixel_values = feature_extractor(
+            images=image, 
+            return_tensors="pt"
+        ).pixel_values.to(device)
+        
+        # Generate text with tokenizer
+        generated_ids = model.generate(pixel_values)
+        page_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        full_text.append(f"Page {idx+1}:\n{page_text}\n\n")
+    
+    return "\n".join(full_text)
 
-def answer_questions(file, qa_pipe):
-    questions = {
-        "company_name": "What is the company name?",
-        "total_challan_value": "What is the total challan value?",
-        # ... (rest of the questions)
-    }
-    return {k: clean_answer(qa_pipe(file, question=v)[0]["answer"]) for k, v in questions.items()}
+# Streamlit UI
+st.title("PDF OCR with GPT2 Tokenizer")
+st.markdown("Upload a PDF file for text extraction")
 
-# ... (rest of the helper functions remain same as previous version)
+uploaded_file = st.file_uploader("Choose PDF file", type="pdf")
 
-if __name__ == "__main__":
-    main()
+if uploaded_file:
+    with st.spinner("Processing PDF..."):
+        pdf_content = uploaded_file.read()
+        extracted_text = perform_ocr(pdf_content)
+        
+        st.subheader("Extracted Text")
+        st.text_area("OCR Output", extracted_text, height=400)
+        
+        st.download_button(
+            "Download Text",
+            extracted_text,
+            file_name="extracted_text.txt",
+            mime="text/plain"
+        )

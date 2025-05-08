@@ -6,4 +6,5 @@ torchvision
 pytesseract 
 pdf2image
 pillow
+opencv-python
 # Davlan/distilbert-base-multilingual-cased-ner-hrl  # your NER model
