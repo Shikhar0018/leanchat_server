@@ -5,4 +5,5 @@ pdfplumber
 torchvision
 pytesseract 
 pdf2image
+pillow
 # Davlan/distilbert-base-multilingual-cased-ner-hrl  # your NER model
